@@ -1,0 +1,155 @@
+---
+name: Cocogitto - Conventional Commits & Release Action
+
+description: |
+  Installs cocogitto and optionally runs conventional commit checks or automated version bumps and releases
+
+branding:
+  icon: git-commit
+  color: red
+
+author: 'step-security'
+
+inputs:
+  git-user:
+    description: Username to set for git config user.name
+    required: false
+    default: "github-actions"
+  git-user-email:
+    description: Email address to set for git config user.email
+    required: false
+    default: "github-actions[bot]@users.noreply.github.com"
+  install-only:
+    description: When set to true, only installs cocogitto and adds it to PATH without running any command
+    required: false
+    default: "false"
+  command:
+    description: Cocogitto subcommand to execute (e.g. check, bump). Required when install-only is false
+    required: false # Required only when install-only is false
+  args:
+    description: Extra flags or arguments passed to the cocogitto subcommand
+    required: false
+    default: ""
+
+outputs:
+  version:
+    description: Version released
+    value: ${{ steps.cog.outputs.version }}
+  stdout:
+    description: Generated changelog
+    value: ${{ steps.cog.outputs.stdout }}
+
+runs:
+  using: composite
+  steps:
+    - name: Subscription check
+      env:
+        REPO_PRIVATE: ${{ github.event.repository.private }}
+      run: |
+        # validate subscription status
+        UPSTREAM="cocogitto/cocogitto-action"
+        ACTION_REPO="${GITHUB_ACTION_REPOSITORY:-}"
+        DOCS_URL="https://docs.stepsecurity.io/actions/stepsecurity-maintained-actions"
+
+        echo ""
+        echo -e "\033[1;36mStepSecurity Maintained Action\033[0m"
+        echo "Secure drop-in replacement for $UPSTREAM"
+        if [ "$REPO_PRIVATE" = "false" ]; then
+          echo -e "\033[32m✓ Free for public repositories\033[0m"
+        fi
+        echo -e "\033[36mLearn more:\033[0m $DOCS_URL"
+        echo ""
+
+        if [ "$REPO_PRIVATE" != "false" ]; then
+          SERVER_URL="${GITHUB_SERVER_URL:-https://github.com}"
+
+          if [ "$SERVER_URL" != "https://github.com" ]; then
+            BODY=$(printf '{"action":"%s","ghes_server":"%s"}' "$ACTION_REPO" "$SERVER_URL")
+          else
+            BODY=$(printf '{"action":"%s"}' "$ACTION_REPO")
+          fi
+
+          API_URL="https://agent.api.stepsecurity.io/v1/github/$GITHUB_REPOSITORY/actions/maintained-actions-subscription"
+
+          RESPONSE=$(curl --max-time 3 -s -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "$BODY" \
+            "$API_URL" -o /dev/null) && CURL_EXIT_CODE=0 || CURL_EXIT_CODE=$?
+
+          if [ $CURL_EXIT_CODE -ne 0 ]; then
+            echo "Timeout or API not reachable. Continuing to next step."
+          elif [ "$RESPONSE" = "403" ]; then
+            echo -e "::error::\033[1;31mThis action requires a StepSecurity subscription for private repositories.\033[0m"
+            echo -e "::error::\033[31mLearn how to enable a subscription: $DOCS_URL\033[0m"
+            exit 1
+          fi
+        fi
+      shell: bash
+
+    - name: Install cocogitto
+      shell: bash
+      run: |
+        VERSION="7.0.0"
+        EXPECTED_SHA="055a9fa8db8ac8ce50074d50162b48b92e9d0c47"
+        ACTUAL_SHA=$(curl -fsSL "https://api.github.com/repos/cocogitto/cocogitto/git/ref/tags/${VERSION}" \
+          | python3 -c "import sys,json; print(json.load(sys.stdin)['object']['sha'])")
+        if [ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]; then
+          echo "::error::cocogitto tag ${VERSION} SHA mismatch. Expected ${EXPECTED_SHA}, got ${ACTUAL_SHA}"
+          exit 1
+        fi
+        OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+        ARCH=$(uname -m)
+        case "$ARCH" in
+          x86_64|amd64)  ARCH="x86_64" ;;
+          aarch64|arm64) ARCH="aarch64" ;;
+          armv7l)        ARCH="armv7" ;;
+          *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
+        esac
+        case "$OS" in
+          linux)
+            case "$ARCH" in
+              x86_64)  TARGET="x86_64-unknown-linux-musl"  ; BIN="cog" ;;
+              aarch64) TARGET="aarch64-unknown-linux-gnu"  ; BIN="cog" ;;
+              armv7)   TARGET="armv7-unknown-linux-musleabihf" ; BIN="cog" ;;
+            esac ;;
+          darwin) TARGET="${ARCH}-apple-darwin"      ; BIN="cog" ;;
+          mingw*) TARGET="${ARCH}-pc-windows-msvc"   ; BIN="cog.exe" ;;
+          *) echo "Unsupported OS: $OS"; exit 1 ;;
+        esac
+        ARCHIVE="cocogitto-${VERSION}-${TARGET}.tar.gz"
+        echo "Downloading cocogitto ${VERSION} for ${TARGET}"
+        mkdir -p "$HOME/.local/bin"
+        set -o pipefail
+        curl -fsSL "https://github.com/cocogitto/cocogitto/releases/download/${VERSION}/${ARCHIVE}" \
+          | tar --strip-components=1 -xz -C "$HOME/.local/bin" "${TARGET}/${BIN}"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+    - id: cog
+      shell: bash
+      if: ${{ inputs.install-only != 'true' }}
+      run: |
+        COG_COMMAND="${{ inputs.command }}"
+        COG_ARGS="${{ inputs.args }}"
+        if [ -z "${COG_COMMAND}" ]; then
+          echo "::error::input 'command' is required when install-only is not true"
+          exit 1
+        fi
+        git config --global user.name "${{ inputs.git-user }}"
+        git config --global user.email "${{ inputs.git-user-email }}"
+        cog --version
+        echo "Running: cog ${COG_COMMAND} ${COG_ARGS}"
+        set -f
+        IFS=' ' read -ra args_array <<< "${COG_ARGS}"
+        set +e
+        COG_OUT="$(cog "${COG_COMMAND}" "${args_array[@]}" 2>&1)"
+        COG_EXIT=$?
+        set +f
+        set -e
+        printf '%s\n' "${COG_OUT}"
+        printf 'stdout<<EOF\n%s\nEOF\n' "${COG_OUT}" >> "${GITHUB_OUTPUT}"
+        [ "${COG_EXIT}" -ne 0 ] && exit "${COG_EXIT}"
+        if [ "${COG_COMMAND}" = "release" ] || [ "${COG_COMMAND}" = "bump" ]; then
+          TAG="$(git describe --tags "$(git rev-list --tags --max-count=1)")"
+          printf 'version=%s\n' "${TAG}" >> "${GITHUB_OUTPUT}"
+        fi
